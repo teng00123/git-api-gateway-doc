@@ -10,7 +10,7 @@ from typing import List, Dict, Optional
 class APIDiffParser:
     def __init__(self):
         # Regex patterns for common API frameworks
-        self.controller_pattern = re.compile(r'(@RestController|@Controller|@Api)")
+        self.controller_pattern = re.compile(r'(@RestController|@Controller|@Api)')
         self.endpoint_pattern = re.compile(r'@(GetMapping|PostMapping|PutMapping|DeleteMapping|RequestMapping)\(["\']([^"\']+)["\']')
         self.method_pattern = re.compile(r'public\s+(?:ResponseEntity<?.*?>|\w+)\s+(\w+)\s*\(')
         

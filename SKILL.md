@@ -236,6 +236,7 @@ GET  /users/{pk}/profile        →  GET_users_pk_profile.md
 - `serializers.py` / `models.py` 变更仅用于类型推断，不单独生成接口
 - URL 前缀自动从 app 目录名推断（`inventory_management/views.py` → `/inventory_management`）
 - `auth_required` 默认 `true`，可在 JSON 中手动修改后重新渲染
+- 当没有接口新增和变更时，不要生成演示项目和文档，结束就好
 
 ## scripts/
 

@@ -31,75 +31,85 @@ import argparse
 
 
 # ─────────────────────────────────────────────
-# Prompt 构造
+# Prompt 构造（批量：每个接口一个 prompt）
 # ─────────────────────────────────────────────
 
-def build_api_desc_prompt(api: dict) -> str:
+def build_batch_prompt(api: dict, need_desc: bool, req_fields: list, resp_fields: list) -> str:
+    """
+    将一个接口的所有待填字段打包成单个 prompt，要求 AI 返回 JSON。
+
+    need_desc:   是否需要生成接口描述
+    req_fields:  [(loc_key, field_index, field_dict), ...]
+    resp_fields: [(field_index, field_dict), ...]
+    """
     method = api.get("method", "")
     path = api.get("path", "")
     func_name = api.get("route_name") or api.get("func_name", "")
-    req = api.get("request", {})
-    body_params = req.get("body_params", [])
-    query_params = req.get("query_params", [])
-    path_params = req.get("path_params", [])
+    current_desc = api.get("description", "")
 
-    params_desc = ""
-    if path_params:
-        params_desc += f"路径参数: {', '.join(p['name'] for p in path_params)}\n"
-    if query_params:
-        params_desc += f"查询参数: {', '.join(p['name'] for p in query_params)}\n"
-    if body_params:
-        params_desc += f"请求体参数: {', '.join(p['name'] for p in body_params)}\n"
+    # 构造字段清单
+    field_lines = []
+    field_keys = []  # 与 field_lines 对应，用于 apply 时定位
 
-    return (
-        f"你是一个 API 文档专家，请根据以下信息，用中文写一句简洁的接口功能描述"
-        f"（15字以内，不加标点符号，不要带引号，直接输出描述文字）。\n\n"
-        f"接口方法: {method}\n"
-        f"接口路径: {path}\n"
-        f"函数名: {func_name}\n"
-        f"{params_desc}\n"
-        f"只输出描述，不要解释，不要换行。"
-    )
+    if need_desc:
+        req = api.get("request", {})
+        all_params = (
+                req.get("path_params", []) +
+                req.get("query_params", []) +
+                req.get("body_params", [])
+        )
+        param_names = ", ".join(p["name"] for p in all_params) if all_params else "无"
+        field_lines.append(f'  "api_desc": "接口功能描述（15字以内）"  // {method} {path}，函数名: {func_name}，参数: {param_names}')
+        field_keys.append(("api_desc", None, None, None))
 
+    for loc_key, j, param in req_fields:
+        key = f"req_{loc_key}_{j}"
+        field_lines.append(f'  "{key}": "字段说明（10字以内）"  // 请求参数 {param["name"]}（{param.get("type","string")}）')
+        field_keys.append(("request_field", loc_key, j, None))
 
-def build_field_desc_prompt(api: dict, field: dict, field_kind: str) -> str:
-    method = api.get("method", "")
-    path = api.get("path", "")
-    api_desc = api.get("description", "")
-    fname = field.get("name", "")
-    ftype = field.get("type", "string")
+    for j, field in resp_fields:
+        key = f"resp_{j}"
+        field_lines.append(f'  "{key}": "字段说明（10字以内）"  // 响应参数 {field["name"]}（{field.get("type","string")}）')
+        field_keys.append(("response_field", None, None, j))
 
-    return (
-        f"你是一个 API 文档专家，请根据以下信息，用中文写一句简洁的字段说明"
-        f"（10字以内，不加标点符号，不要带引号，直接输出说明文字）。\n\n"
-        f"所属接口: {method} {path}\n"
-        f"接口描述: {api_desc}\n"
-        f"字段位置: {field_kind}\n"
-        f"字段名称: {fname}\n"
-        f"字段类型: {ftype}\n\n"
-        f"只输出字段说明，不要解释，不要换行。"
-    )
+    fields_block = "\n".join(field_lines)
+
+    prompt = f"""你是一个 API 文档专家。请为以下接口的字段批量生成简洁的中文描述，直接返回 JSON，不要任何解释。
+
+接口: {method} {path}
+当前描述: {current_desc or "（待生成）"}
+
+请填写以下 JSON 中每个字段的描述（替换引号内的说明文字，保持 key 不变）：
+
+{{
+{fields_block}
+}}
+
+要求：
+- 每个值 10 字以内（api_desc 15 字以内）
+- 不加标点符号，不带引号
+- 只输出 JSON，不要任何其他内容"""
+
+    return prompt, field_keys
 
 
 # ─────────────────────────────────────────────
-# 收集任务
+# 收集任务（按接口批量）
 # ─────────────────────────────────────────────
 
 def collect_tasks(doc: dict, force: bool = False) -> list:
     """
-    扫描 JSON，收集所有需要 AI 生成描述的任务。
+    扫描 JSON，按接口维度收集批量任务。
 
     每个任务结构：
     {
-      "id": "唯一标识（api索引_kind_字段索引）",
+      "id": "batch_{api_index}",
       "api_index": int,
-      "kind": "api_desc" | "request_field" | "response_field",
-      "loc_key": str,        # 仅 request_field 有
-      "field_index": int,    # 仅 request_field / response_field 有
-      "label": "用于展示的可读标签",
-      "prompt": "发给 AI 的完整 prompt",
-      "current": "当前值（空则需要填）",
-      "result": ""           # 由 Agent 填写后回填此字段
+      "kind": "batch",
+      "label": "GET /path （N 个字段）",
+      "prompt": "发给 AI 的完整批量 prompt",
+      "field_keys": [...],   # 与 prompt 中字段对应的写回路径
+      "result": {}           # 由 Agent 填写：{"api_desc": "...", "req_query_params_0": "...", ...}
     }
     """
     tasks = []
@@ -107,50 +117,37 @@ def collect_tasks(doc: dict, force: bool = False) -> list:
         method = api.get("method", "")
         path = api.get("path", "")
 
-        # 接口描述
-        desc = api.get("description", "")
-        if force or not desc or desc.endswith("接口"):
-            tasks.append({
-                "id": f"{i}_api_desc",
-                "api_index": i,
-                "kind": "api_desc",
-                "label": f"接口描述 | {method} {path}",
-                "prompt": build_api_desc_prompt(api),
-                "current": desc,
-                "result": "",
-            })
+        need_desc = force or not api.get("description", "") or api.get("description", "").endswith("接口")
 
-        # 请求参数字段
         req = api.get("request", {})
+        req_fields = []
         for loc_key in ("path_params", "query_params", "body_params"):
             for j, param in enumerate(req.get(loc_key, [])):
                 if force or not param.get("description", ""):
-                    tasks.append({
-                        "id": f"{i}_request_{loc_key}_{j}",
-                        "api_index": i,
-                        "kind": "request_field",
-                        "loc_key": loc_key,
-                        "field_index": j,
-                        "label": f"请求字段 | {method} {path} → {param.get('name', '')}",
-                        "prompt": build_field_desc_prompt(api, param, "请求参数"),
-                        "current": param.get("description", ""),
-                        "result": "",
-                    })
+                    req_fields.append((loc_key, j, param))
 
-        # 响应参数字段
-        resp_fields = api.get("response", {}).get("success", {}).get("fields", [])
-        for j, field in enumerate(resp_fields):
-            if force or not field.get("description", ""):
-                tasks.append({
-                    "id": f"{i}_response_field_{j}",
-                    "api_index": i,
-                    "kind": "response_field",
-                    "field_index": j,
-                    "label": f"响应字段 | {method} {path} → {field.get('name', '')}",
-                    "prompt": build_field_desc_prompt(api, field, "响应参数"),
-                    "current": field.get("description", ""),
-                    "result": "",
-                })
+        resp_fields_raw = api.get("response", {}).get("success", {}).get("fields", [])
+        resp_fields = [
+            (j, field)
+            for j, field in enumerate(resp_fields_raw)
+            if force or not field.get("description", "")
+        ]
+
+        if not need_desc and not req_fields and not resp_fields:
+            continue
+
+        total = (1 if need_desc else 0) + len(req_fields) + len(resp_fields)
+        prompt, field_keys = build_batch_prompt(api, need_desc, req_fields, resp_fields)
+
+        tasks.append({
+            "id": f"batch_{i}",
+            "api_index": i,
+            "kind": "batch",
+            "label": f"{method} {path} （{total} 个字段）",
+            "prompt": prompt,
+            "field_keys": field_keys,
+            "result": {},
+        })
 
     return tasks
 
@@ -159,21 +156,39 @@ def collect_tasks(doc: dict, force: bool = False) -> list:
 # 写回结果
 # ─────────────────────────────────────────────
 
-def apply_task_result(doc: dict, task: dict, result: str):
-    """将单条 result 写回 doc 对应位置"""
+def apply_batch_result(doc: dict, task: dict):
+    """将一条批量任务的 result dict 写回 doc"""
     i = task["api_index"]
     api = doc["apis"][i]
-    kind = task["kind"]
+    result = task.get("result", {})
+    if not result:
+        return 0
 
-    if kind == "api_desc":
-        api["description"] = result
-    elif kind == "request_field":
-        loc_key = task["loc_key"]
-        j = task["field_index"]
-        api["request"][loc_key][j]["description"] = result
-    elif kind == "response_field":
-        j = task["field_index"]
-        api["response"]["success"]["fields"][j]["description"] = result
+    written = 0
+    for fk in task["field_keys"]:
+        kind, loc_key, req_j, resp_j = fk
+
+        if kind == "api_desc":
+            val = result.get("api_desc", "").strip().strip("。，、；：").strip()
+            if val:
+                api["description"] = val
+                written += 1
+
+        elif kind == "request_field":
+            key = f"req_{loc_key}_{req_j}"
+            val = result.get(key, "").strip().strip("。，、；：").strip()
+            if val:
+                api["request"][loc_key][req_j]["description"] = val
+                written += 1
+
+        elif kind == "response_field":
+            key = f"resp_{resp_j}"
+            val = result.get(key, "").strip().strip("。，、；：").strip()
+            if val:
+                api["response"]["success"]["fields"][resp_j]["description"] = val
+                written += 1
+
+    return written
 
 
 # ─────────────────────────────────────────────
@@ -181,7 +196,7 @@ def apply_task_result(doc: dict, task: dict, result: str):
 # ─────────────────────────────────────────────
 
 def cmd_export_prompts(args):
-    """--export-prompts：扫描 JSON，输出 prompts.json 任务清单"""
+    """--export-prompts：扫描 JSON，输出 prompts.json 批量任务清单"""
     with open(args.input, "r", encoding="utf-8") as f:
         doc = json.load(f)
 
@@ -191,23 +206,20 @@ def cmd_export_prompts(args):
         print("✅ 所有字段描述已完整，无需增强。")
         return
 
-    # 统计
-    api_desc_count   = sum(1 for t in tasks if t["kind"] == "api_desc")
-    req_field_count  = sum(1 for t in tasks if t["kind"] == "request_field")
-    resp_field_count = sum(1 for t in tasks if t["kind"] == "response_field")
-    print(f"📋 共 {len(tasks)} 个描述需要 AI 生成：")
-    print(f"   接口描述: {api_desc_count} 个")
-    print(f"   请求字段: {req_field_count} 个")
-    print(f"   响应字段: {resp_field_count} 个")
+    total_fields = sum(len(t["field_keys"]) for t in tasks)
+    print(f"📋 共 {len(tasks)} 个接口需要 AI 生成描述（合计 {total_fields} 个字段）")
+    for t in tasks:
+        print(f"   [{t['id']}] {t['label']}")
 
     out_path = args.output or "prompts.json"
     os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(tasks, f, ensure_ascii=False, indent=2)
-    print(f"💾 任务清单已保存到: {out_path}")
+    print(f"\n💾 任务清单已保存到: {out_path}")
     print()
-    print("📌 下一步：由 Agent 读取该文件，逐条调用 AI 填写每条任务的 result 字段，")
-    print(f"   然后执行：python3 enrich_api_doc.py --apply-results -p {out_path} -i {args.input}")
+    print("📌 下一步：由 Agent 读取该文件，对每条任务调用 AI，")
+    print("   将返回的 JSON 填入对应任务的 result 字段，然后执行：")
+    print(f"   python3 enrich_api_doc.py --apply-results -p {out_path} -i {args.input}")
 
 
 def cmd_apply_results(args):
@@ -218,18 +230,17 @@ def cmd_apply_results(args):
     with open(args.prompts, "r", encoding="utf-8") as f:
         tasks = json.load(f)
 
-    success = 0
+    total_written = 0
     skip = 0
     for task in tasks:
-        result = task.get("result", "").strip().strip("。，、；：").strip()
-        if result:
-            apply_task_result(doc, task, result)
-            success += 1
-        else:
+        if not task.get("result"):
             print(f"  ⚠️  跳过（result 为空）: {task.get('label', task.get('id', ''))}")
             skip += 1
+            continue
+        written = apply_batch_result(doc, task)
+        total_written += written
 
-    print(f"\n✅ 写回完成：成功 {success} 条，跳过 {skip} 条")
+    print(f"\n✅ 写回完成：共写入 {total_written} 个字段描述，跳过 {skip} 条任务")
 
     out_path = args.input if args.inplace else (args.output or args.input)
     os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
@@ -239,7 +250,7 @@ def cmd_apply_results(args):
 
 
 def cmd_dry_run(args):
-    """--dry-run：仅打印任务预览，不写文件（兼容旧用法）"""
+    """--dry-run：仅打印任务预览，不写文件"""
     with open(args.input, "r", encoding="utf-8") as f:
         doc = json.load(f)
 
@@ -249,11 +260,11 @@ def cmd_dry_run(args):
         print("✅ 所有字段描述已完整，无需增强。")
         return
 
-    print(f"📋 共 {len(tasks)} 个描述需要 AI 生成：\n")
+    total_fields = sum(len(t["field_keys"]) for t in tasks)
+    print(f"📋 共 {len(tasks)} 个批量任务（合计 {total_fields} 个字段）\n")
     for idx, t in enumerate(tasks):
         print(f"  [{idx+1}/{len(tasks)}] {t['label']}")
-        print(f"  当前值: '{t['current']}'")
-        print(f"  Prompt: {t['prompt'][:120]}...")
+        print(f"  Prompt 预览: {t['prompt'][:200]}...")
         print()
 
 

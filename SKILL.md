@@ -76,12 +76,16 @@ python3 scripts/enrich_api_doc.py --dry-run -i api_doc.json
 
 **Step 2.5-B：Agent 填充描述（由你完成）**
 
-读取 `prompts.json`，其中每条任务包含：
-- `label`：可读标签，说明这是哪个接口/字段
-- `prompt`：发给 AI 的完整 prompt
-- `result`：**需要你填写 AI 生成的描述**
+读取 `prompts.json`，其中每条任务对应**一个接口**的所有空字段，包含：
+- `label`：接口标识，如 `GET /articles/ （6 个字段）`
+- `prompt`：发给 AI 的批量 prompt，要求 AI 返回 JSON
+- `field_keys`：字段写回路径（脚本内部使用，无需关注）
+- `result`：**需要你填写 AI 返回的 JSON 对象**，key 与 prompt 中一致
 
-对每条任务，将 AI 的回答写入对应的 `result` 字段，保存文件。
+对每条任务，将 AI 返回的 JSON 填入 `result` 字段，保存文件。
+
+> **批量设计**：每个接口的所有字段打包为一个 prompt，AI 一次返回所有字段描述，
+> 接口数量即为 AI 调用次数（而非字段总数），大幅减少调用轮次。
 
 **Step 2.5-C：将结果写回 api_doc.json**
 
@@ -322,9 +326,9 @@ GET  /users/{pk}/profile        →  GET_users_pk_profile.md
 
 - `parse_git_diff.py`：解析 Django/DRF git diff，输出结构化 API JSON
 - `enrich_api_doc.py`：AI 字段描述增强器（Agent 驱动模式，平台无关）
-    - `--export-prompts`：扫描 JSON，输出 prompts.json 任务清单（含每条字段的 prompt）
-    - `--apply-results`：读取 Agent 填好 result 的 prompts.json，写回 api_doc.json
-    - `--dry-run`：预览任务，不写文件
+  - `--export-prompts`：扫描 JSON，输出 prompts.json 任务清单（含每条字段的 prompt）
+  - `--apply-results`：读取 Agent 填好 result 的 prompts.json，写回 api_doc.json
+  - `--dry-run`：预览任务，不写文件
 - `generate_md.py`：读取 API JSON + 模板，渲染为 Markdown 文档
 
 ## assets/

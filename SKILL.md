@@ -5,6 +5,22 @@ description: Scan git diff for new or modified API interfaces and generate gatew
 
 # Git API Gateway Doc
 
+## ⚠️ 严格约束（必须遵守）
+
+1. **用户必须提供真实的 diff 文件或 diff 内容**，才能执行本 skill。
+2. **禁止在任何情况下自动生成示例 diff、演示项目或 demo 数据**，即使解析结果为空。
+3. 如果解析结果 `total_changes = 0`（无 API 变更），**只输出提示信息，立即停止，不生成任何文件**。
+4. 用户未提供 diff 时，**只询问 diff 文件路径，不做其他任何操作**。
+
+```
+✅ 用户给了 diff → 解析 → 有 API → 生成文档
+✅ 用户给了 diff → 解析 → 无 API → 提示"未检测到 API 变更，请确认 diff 包含 urls.py 或 views.py 的修改"
+❌ 用户未给 diff  → 禁止生成 demo / 示例 / 演示项目
+❌ 解析结果为空  → 禁止补充 demo 数据或示例接口
+```
+
+---
+
 ## Overview
 
 从 Django / DRF 项目的 `git diff` 文件中自动识别新增和变更的 API 接口，生成标准化 Markdown 文档。
@@ -37,6 +53,52 @@ python3 scripts/parse_git_diff.py \
   --output api_doc.json
 ```
 
+### Step 2.5（可选）：AI 增强字段描述
+
+本步骤由 **Agent 自身驱动**，脚本不调用任何 AI 接口，适配任意平台。
+
+**Step 2.5-A：导出待填充的任务清单**
+
+```bash
+python3 scripts/enrich_api_doc.py --export-prompts \
+  -i api_doc.json \
+  -o prompts.json
+
+# 强制重新生成所有描述（包括已有的）
+python3 scripts/enrich_api_doc.py --export-prompts \
+  -i api_doc.json \
+  -o prompts.json \
+  --force
+
+# 预览任务，不写文件
+python3 scripts/enrich_api_doc.py --dry-run -i api_doc.json
+```
+
+**Step 2.5-B：Agent 填充描述（由你完成）**
+
+读取 `prompts.json`，其中每条任务包含：
+- `label`：可读标签，说明这是哪个接口/字段
+- `prompt`：发给 AI 的完整 prompt
+- `result`：**需要你填写 AI 生成的描述**
+
+对每条任务，将 AI 的回答写入对应的 `result` 字段，保存文件。
+
+**Step 2.5-C：将结果写回 api_doc.json**
+
+```bash
+# 原地覆盖
+python3 scripts/enrich_api_doc.py --apply-results \
+  -p prompts.json \
+  -i api_doc.json \
+  --inplace
+
+# 输出到新文件
+python3 scripts/enrich_api_doc.py --apply-results \
+  -p prompts.json \
+  -i api_doc.json \
+  -o api_doc_enriched.json
+```
+
 ### Step 3：使用模板生成 MD（每个接口单独一个文件）
 
 ```bash
@@ -63,7 +125,26 @@ python3 scripts/generate_md.py \
   --filter 新增
 ```
 
-### 一键端到端
+### 一键端到端（含 AI 增强）
+
+```bash
+# Step 1-2: 解析 diff → 导出任务清单
+git diff HEAD~1 > changes.diff && \
+python3 scripts/parse_git_diff.py -d changes.diff -o api_doc.json && \
+python3 scripts/enrich_api_doc.py --export-prompts -i api_doc.json -o prompts.json
+
+# Step 3: 由 Agent 读取 prompts.json，填写每条 result 字段
+
+# Step 4: 写回 + 生成 MD
+python3 scripts/enrich_api_doc.py --apply-results -p prompts.json -i api_doc.json --inplace && \
+python3 scripts/generate_md.py \
+  -i api_doc.json \
+  --split \
+  --output-dir api_docs/ \
+  --api-template-file assets/default_template.md
+```
+
+不需要 AI 增强时，跳过 Step 2.5 直接生成：
 
 ```bash
 git diff HEAD~1 > changes.diff && \
@@ -236,11 +317,14 @@ GET  /users/{pk}/profile        →  GET_users_pk_profile.md
 - `serializers.py` / `models.py` 变更仅用于类型推断，不单独生成接口
 - URL 前缀自动从 app 目录名推断（`inventory_management/views.py` → `/inventory_management`）
 - `auth_required` 默认 `true`，可在 JSON 中手动修改后重新渲染
-- 当没有接口新增和变更时，不要生成演示项目和文档，结束就好
 
 ## scripts/
 
 - `parse_git_diff.py`：解析 Django/DRF git diff，输出结构化 API JSON
+- `enrich_api_doc.py`：AI 字段描述增强器（Agent 驱动模式，平台无关）
+    - `--export-prompts`：扫描 JSON，输出 prompts.json 任务清单（含每条字段的 prompt）
+    - `--apply-results`：读取 Agent 填好 result 的 prompts.json，写回 api_doc.json
+    - `--dry-run`：预览任务，不写文件
 - `generate_md.py`：读取 API JSON + 模板，渲染为 Markdown 文档
 
 ## assets/

@@ -18,7 +18,7 @@ $request_params
 ### 调用示例
 ```bash
 curl -X '$method' \
-  'http://example.com/$path' \
+  'http://example.com$path' \
   -H 'accept: application/json' \
   -H 'Content-Type: application/json' \
   -H 'X-Bkapi-Authorization: {"bk_app_code": "abc", "bk_app_secret": "test", "bk_username":"wxid"}' \

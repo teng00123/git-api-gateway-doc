@@ -239,22 +239,80 @@ class DjangoDiffParser:
 
     # ── 主入口 ──────────────────────────────────
     def parse(self) -> list:
+        # 分两轮收集：urls 只提取路由映射，views 提取描述和参数
+        url_entries = []   # [{func_name, path, method, route_name, change_type, source_file}]
+        view_entries = []  # [{func_name, description, request_params, response_params, method, ...}]
+
         for file_info in self.files:
             path = file_info["path"]
             lines = file_info["lines"]
             is_new = file_info["is_new_file"]
 
             if path.endswith("urls.py"):
-                self._parse_urls_file(path, lines, is_new)
+                url_entries.extend(self._parse_urls_file(path, lines, is_new))
             elif path.endswith("views.py"):
-                self._parse_views_file(path, lines, is_new)
-            # serializers.py 作为辅助，暂时不单独解析路由
+                view_entries.extend(self._parse_views_file(path, lines, is_new))
 
+        # 合并：以 url_entries 为路径权威，用 func_name 关联 view_entries 的描述/参数
+        # 建立 func_name → view_entry 的索引
+        view_index = {}
+        for ve in view_entries:
+            view_index.setdefault(ve["func_name"], ve)
+
+        merged = []
+        seen_paths = set()  # (method, path) 去重
+
+        for ue in url_entries:
+            fn = ue["func_name"]
+            ve = view_index.get(fn, {})
+
+            # 方法：优先用 views.py 中 @api_view 明确声明的，fallback 用 urls.py 推断的
+            method = ve.get("method") or ue["method"]
+            key = (method, ue["path"])
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            api = self._make_api_entry(
+                method=method,
+                path=ue["path"],
+                description=ve.get("description") or ue.get("description", f"{fn} 接口"),
+                func_name=fn,
+                route_name=ue.get("route_name", fn),
+                change_type=ue.get("change_type", CHANGE_TYPE_NEW),
+                source_file=ve.get("source_file") or ue.get("source_file", ""),
+                request_params=ve.get("request_params", []),
+                response_params=ve.get("response_params", []),
+            )
+            merged.append(api)
+
+        # urls.py 中没有的接口（view_entries 里有但 url 里没有），也补充进来
+        url_funcs = {ue["func_name"] for ue in url_entries}
+        for ve in view_entries:
+            fn = ve["func_name"]
+            if fn not in url_funcs:
+                key = (ve["method"], ve.get("path", ""))
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    api = self._make_api_entry(
+                        method=ve["method"],
+                        path=ve.get("path", f"/{fn.replace('_', '-')}"),
+                        description=ve.get("description", f"{fn} 接口"),
+                        func_name=fn,
+                        route_name=fn,
+                        change_type=ve.get("change_type", CHANGE_TYPE_NEW),
+                        source_file=ve.get("source_file", ""),
+                        request_params=ve.get("request_params", []),
+                        response_params=ve.get("response_params", []),
+                    )
+                    merged.append(api)
+
+        self.apis = merged
         return self.apis
 
     # ── 解析 urls.py ────────────────────────────
-    def _parse_urls_file(self, path: str, lines: list, is_new_file: bool):
+    def _parse_urls_file(self, path: str, lines: list, is_new_file: bool) -> list:
         url_prefix = build_url_prefix(path)
+        entries = []
 
         # 只处理新增行
         added_lines = [l[1:] for l in lines if l.startswith("+") and not l.startswith("+++")]
@@ -280,30 +338,33 @@ class DjangoDiffParser:
             view_func = m.group(2)
             route_name = m.group(3) if m.lastindex >= 3 else view_func
 
+            # 跳过 include() 引用
+            if view_func == "include":
+                continue
+
             full_path = url_prefix + normalize_url_path(raw_path)
             methods = infer_method_from_view_func(view_func)
-            change_type = CHANGE_TYPE_NEW if is_new_file else CHANGE_TYPE_NEW
-
-            # 从注释提取描述
-            desc = self._extract_inline_comment(line) or f"{view_func} 接口"
+            change_type = CHANGE_TYPE_NEW
 
             for method in methods:
-                api = self._make_api_entry(
-                    method=method,
-                    path=full_path,
-                    description=desc,
-                    func_name=view_func,
-                    route_name=route_name,
-                    change_type=change_type,
-                    source_file=path,
-                )
-                self.apis.append(api)
+                entries.append({
+                    "func_name": view_func,
+                    "method": method,
+                    "path": full_path,
+                    "route_name": route_name,
+                    "change_type": change_type,
+                    "source_file": path,
+                    "description": "",
+                })
+
+        return entries
 
     # ── 解析 views.py ───────────────────────────
-    def _parse_views_file(self, path: str, lines: list, is_new_file: bool):
+    def _parse_views_file(self, path: str, lines: list, is_new_file: bool) -> list:
         url_prefix = build_url_prefix(path)
-        pending_methods = []   # 当前装饰器收集到的方法
-        pending_action_path = None  # @action 中的 url_path
+        entries = []
+        pending_methods = []
+        pending_action_path = None
         pending_change_type = CHANGE_TYPE_NEW
 
         i = 0
@@ -318,15 +379,11 @@ class DjangoDiffParser:
                 continue
 
             is_added = line.startswith("+") and not line.startswith("+++")
-            is_context = line.startswith(" ")
 
             # ── 检测 @api_view ──────────────────
             if "@api_view(" in stripped:
                 pending_methods = extract_methods_from_api_view(stripped)
-                if "# NEW" in raw.upper() or "# 新增" in raw:
-                    pending_change_type = CHANGE_TYPE_NEW
-                else:
-                    pending_change_type = CHANGE_TYPE_MODIFIED if not is_new_file else CHANGE_TYPE_NEW
+                pending_change_type = CHANGE_TYPE_NEW if (is_added or is_new_file) else CHANGE_TYPE_MODIFIED
 
             # ── 检测 @action ────────────────────
             elif "@action(" in stripped:
@@ -335,7 +392,7 @@ class DjangoDiffParser:
                 pending_action_path = url_m.group(1) if url_m else None
                 pending_change_type = CHANGE_TYPE_NEW if (is_added or is_new_file) else CHANGE_TYPE_MODIFIED
 
-            # ── 检测函数/方法定义 def xxx(request ...) ─
+            # ── 检测函数定义 def xxx(...) ────────
             elif stripped.startswith("def ") and ("request" in stripped or "self" in stripped):
                 func_m = re.match(r"def\s+(\w+)\s*\(", stripped)
                 if not func_m:
@@ -343,56 +400,42 @@ class DjangoDiffParser:
                     continue
 
                 func_name = func_m.group(1)
-                # 跳过 helper / private 函数
-                if func_name.startswith("_") or func_name in (
-                        "calculate_supplier_score", "get_performance_grade",
-                ):
+                if func_name.startswith("_"):
                     pending_methods = []
                     i += 1
                     continue
 
-                # 收集函数体（新增行）以提取 docstring / 注释
                 body_lines = self._collect_function_body(lines, i)
-
-                # 提取描述
                 desc = self._extract_func_description(body_lines, func_name)
-
-                # 提取 URL 路径
                 extracted_path = self._extract_path_from_body(body_lines, url_prefix, func_name, pending_action_path)
 
-                # 确定方法
                 if not pending_methods:
                     pending_methods = self._infer_methods_from_func(func_name, body_lines)
 
-                # 变更类型
-                if not is_added and not is_new_file:
-                    change_type = CHANGE_TYPE_MODIFIED
-                else:
-                    change_type = pending_change_type
+                change_type = pending_change_type if (is_added or is_new_file) else CHANGE_TYPE_MODIFIED
 
-                # 提取请求/响应参数
                 request_params = self._extract_request_params(body_lines)
                 response_params = self._extract_response_params(body_lines)
 
                 for method in pending_methods:
-                    api = self._make_api_entry(
-                        method=method,
-                        path=extracted_path,
-                        description=desc,
-                        func_name=func_name,
-                        route_name=func_name,
-                        change_type=change_type,
-                        source_file=path,
-                        request_params=request_params,
-                        response_params=response_params,
-                    )
-                    self.apis.append(api)
+                    entries.append({
+                        "func_name": func_name,
+                        "method": method,
+                        "path": extracted_path,
+                        "route_name": func_name,
+                        "change_type": change_type,
+                        "source_file": path,
+                        "description": desc,
+                        "request_params": request_params,
+                        "response_params": response_params,
+                    })
 
-                # 重置 pending
                 pending_methods = []
                 pending_action_path = None
 
             i += 1
+
+        return entries
 
     # ── 辅助：收集函数体行 ───────────────────────
     def _collect_function_body(self, lines: list, def_index: int, max_lines: int = 60) -> list:
@@ -742,6 +785,12 @@ def main():
         sys.exit(1)
 
     doc = parse_diff_to_json(args.diff_file, args.output)
+
+    # 无 API 变更时，直接提示并退出，不生成任何文件
+    if doc["meta"]["total_changes"] == 0:
+        print("⚠️  未检测到任何 API 变更。")
+        print("   请确认 diff 文件包含 urls.py 或 views.py 的修改（+ 开头的新增行）。")
+        sys.exit(0)
 
     if not args.output:
         print(json.dumps(doc, ensure_ascii=False, indent=2))

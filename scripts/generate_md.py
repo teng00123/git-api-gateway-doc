@@ -344,16 +344,16 @@ def render_document(doc: dict, doc_template: str, api_template: str) -> str:
 
 def _safe_filename(api: dict) -> str:
     """
-    根据 API 的 method + path 生成安全的文件名
-    例如: GET /inventory/stock-levels/{pk}/adjust → GET_inventory_stock-levels_{pk}_adjust.md
+    根据 API 的 path 生成安全的文件名（只取路径后缀名）
+    例如: GET /inventory/stock-levels/{pk}/adjust → adjust.md
     """
-    method = api.get("method", "UNKNOWN").upper()
-    path   = api.get("path", "unknown").strip("/")
-    # 将路径分隔符和特殊字符替换为下划线
-    safe_path = re.sub(r"[/\s]", "_", path)
-    safe_path = re.sub(r"[^\w\-.]", "", safe_path)
-    # return f"{method}_{safe_path}.md"
-    return f"{safe_path}.md"
+    path = api.get("path", "unknown").strip("/")
+    # 分割路径并取最后一部分
+    path_parts = path.split("/")
+    last_part = path_parts[-1] if path_parts else "unknown"
+    # 清理特殊字符
+    safe_name = re.sub(r"[^\w\-.]", "", last_part)
+    return f"{safe_name}.md"
 
 
 def generate_md(
